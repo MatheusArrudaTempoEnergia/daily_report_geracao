@@ -150,7 +150,7 @@ def resolve_report_period(cli_year: Optional[int], cli_month: Optional[int]) -> 
 # --- E-MAIL --------------------------------------------------------
 EMAIL_SENDER    = "matheus.arruda@tempoenergia.com.br"
 EMAIL_PASSWORD  = "Ma!%(#%&"
-EMAIL_TO        = ["cilinaldo.silva@tempoenergia.com.br, matheus.arruda@tempoenergia.com.br"]   # lista de destinatários
+EMAIL_TO        = ["cilinaldo.silva@tempoenergia.com.br, matheus.arruda@tempoenergia.com.br, maicon.santos@tempoenergia.com.br, silvio.araujo@tempoenergia.com.br, victor.ferrari@tempoenergia.com.br, back@tempoenergia.com.br"]   # lista de destinatários
 EMAIL_SMTP_HOST = "smtp.office365.com"
 EMAIL_SMTP_PORT = 587
 
