@@ -16,6 +16,7 @@ import base64
 import logging
 import argparse
 import calendar
+import random
 import smtplib
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -27,7 +28,10 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email import encoders
 
+import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -61,11 +65,30 @@ log = logging.getLogger(__name__)
 # ═════════════════════════════════════════════
 
 # --- API -----------------------------------------------------------
-API_BASE_URL = "https://api.tempoenergia.com/gestao/ccee_medicao/"   # TODO: URL da sua API
+API_BASE_URL = "https://api.tempoenergia.com/gestao/ccee_medicao/"
 API_HEADERS  = {
-    # "Authorization": "Bearer SEU_TOKEN",       # TODO: descomente e preencha
+    # "Authorization": "Bearer SEU_TOKEN",
     "Content-Type": "application/json",
 }
+API_MAX_ATTEMPTS = 25   # tentativas máximas por ponto antes de desistir
+
+# O adaptador lida apenas com erros de rede/conexão; HTTP 500 é tratado explicitamente.
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    allowed_methods=["GET"],
+    raise_on_status=False,
+)
+_http_adapter = HTTPAdapter(max_retries=_retry_strategy)
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.mount("https://", _http_adapter)
+    s.mount("http://",  _http_adapter)
+    s.headers.update(API_HEADERS)
+    return s
+
+_session = _make_session()
 
 
 def get_api_date_range(reference_date: Optional[date] = None) -> tuple[date, date]:
@@ -150,7 +173,7 @@ def resolve_report_period(cli_year: Optional[int], cli_month: Optional[int]) -> 
 # --- E-MAIL --------------------------------------------------------
 EMAIL_SENDER    = "matheus.arruda@tempoenergia.com.br"
 EMAIL_PASSWORD  = "Ma!%(#%&"
-EMAIL_TO        = ["cilinaldo.silva@tempoenergia.com.br, matheus.arruda@tempoenergia.com.br, maicon.santos@tempoenergia.com.br, silvio.araujo@tempoenergia.com.br, victor.ferrari@tempoenergia.com.br, back@tempoenergia.com.br"]   # lista de destinatários
+EMAIL_TO        = ["matheus.arruda@tempoenergia.com.br"]   # lista de destinatários
 EMAIL_SMTP_HOST = "smtp.office365.com"
 EMAIL_SMTP_PORT = 587
 
@@ -274,20 +297,41 @@ def fetch_meter_data(meter_id: str, year: int, month: int) -> Optional[pd.DataFr
     ea_geracao_kwh, ea_consumo_kwh, er_geracao_kvarh, er_consumo_kvarh
     Retorna None se a API não responder ou não tiver dados.
     """
-    try:
-        params = build_api_params(meter_id, year, month)
-        resp = requests.get(
-            API_BASE_URL,
-            params=params,
-            headers=API_HEADERS,
-            timeout=500,
-        )
-        resp.raise_for_status()
-        json_data = resp.json()
+    params = build_api_params(meter_id, year, month)
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > API_MAX_ATTEMPTS:
+            log.warning("  [%s] %d tentativas esgotadas — sem dados.", meter_id, API_MAX_ATTEMPTS)
+            return None
 
-        # A API pode retornar {"dados": [...]} ou diretamente [...]
+        wait = 2 ** attempt if attempt <= 3 else random.randint(10, 20)
+
+        try:
+            resp = _session.get(API_BASE_URL, params=params, timeout=500)
+        except requests.exceptions.RequestException as exc:
+            log.warning("  [%s] Erro de conexão (tentativa %d/%d, próxima em %ds): %s", meter_id, attempt, API_MAX_ATTEMPTS, wait, exc)
+            time.sleep(wait)
+            continue
+        except Exception as exc:
+            log.error("  [%s] Erro inesperado: %s", meter_id, exc)
+            return None
+
+        if not resp.ok:
+            log.warning(
+                "  [%s] HTTP %s — tentativa %d/%d, próxima em %ds...",
+                meter_id, resp.status_code, attempt, API_MAX_ATTEMPTS, wait,
+            )
+            time.sleep(wait)
+            continue
+
+        try:
+            json_data = resp.json()
+        except Exception as exc:
+            log.error("  [%s] Resposta inválida (JSON): %s", meter_id, exc)
+            return None
+
         records = json_data.get("dados", json_data) if isinstance(json_data, dict) else json_data
-
         if not records:
             log.warning("  [%s] API retornou lista vazia.", meter_id)
             return None
@@ -298,24 +342,17 @@ def fetch_meter_data(meter_id: str, year: int, month: int) -> Optional[pd.DataFr
         df["ea_geracao_kwh"] = pd.to_numeric(df.get("ea_geracao_kwh", 0), errors="coerce").fillna(0)
         return df
 
-    except requests.exceptions.RequestException as exc:
-        log.warning("  [%s] Erro ao buscar dados: %s", meter_id, exc)
-        return None
-    except Exception as exc:
-        log.error("  [%s] Erro inesperado: %s", meter_id, exc)
-        return None
-
 
 def fetch_all_data(year: int, month: int) -> dict[str, Optional[pd.DataFrame]]:
-    """Busca dados de todos os medidores configurados."""
-    all_meters = {
+    """Busca dados de todos os medidores, um por vez."""
+    all_meters = sorted({
         meter_id
         for meters in CATEGORIES.values()
         for meter_id, _ in meters
-    }
+    })
     results: dict[str, Optional[pd.DataFrame]] = {}
-    for meter_id in sorted(all_meters):
-        log.info("Buscando medidor: %s", meter_id)
+    for idx, meter_id in enumerate(all_meters):
+        log.info("Buscando medidor: %s (%d/%d)", meter_id, idx + 1, len(all_meters))
         results[meter_id] = fetch_meter_data(meter_id, year, month)
     return results
 
@@ -1318,7 +1355,6 @@ def generate_demo_data(year: int, month: int) -> dict[str, Optional[pd.DataFrame
     Remove esta função quando a API estiver disponível.
     """
     import numpy as np
-    import random
 
     days_in_month = calendar.monthrange(year, month)[1]
     all_meters = {
