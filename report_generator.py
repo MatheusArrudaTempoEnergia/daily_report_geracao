@@ -2,12 +2,12 @@
 """
 Gerador de Relatório Diário de Geração de Energia — EnergoPro
 =============================================================
-Busca dados da API, gera HTML com tabelas + gráficos e envia por e-mail.
+Busca dados da API, gera HTML com tabelas + gráficos e abre rascunho no Outlook.
 
 Uso:
     python report_generator.py                        # Mês/ano atual
     python report_generator.py --year 2026 --month 4 # Mês/ano específico
-    python report_generator.py --no-email             # Sem envio de e-mail
+    python report_generator.py --no-email             # Sem abrir e-mail
 """
 
 import os
@@ -16,13 +16,22 @@ import base64
 import logging
 import argparse
 import calendar
+import random
 import smtplib
 from datetime import datetime, date, timedelta
 from typing import Optional
 from html import escape
 from urllib.parse import urlparse, parse_qs
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email import encoders
 
+import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -39,10 +48,6 @@ from reportlab.platypus import (
     Spacer, Image, KeepTogether, HRFlowable,
 )
 
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -60,11 +65,30 @@ log = logging.getLogger(__name__)
 # ═════════════════════════════════════════════
 
 # --- API -----------------------------------------------------------
-API_BASE_URL = "http://localhost/gestao/ccee_medicao/"   # TODO: URL da sua API
+API_BASE_URL = "https://api.tempoenergia.com/gestao/ccee_medicao/"
 API_HEADERS  = {
-    # "Authorization": "Bearer SEU_TOKEN",       # TODO: descomente e preencha
+    # "Authorization": "Bearer SEU_TOKEN",
     "Content-Type": "application/json",
 }
+API_MAX_ATTEMPTS = 25   # tentativas máximas por ponto antes de desistir
+
+# O adaptador lida apenas com erros de rede/conexão; HTTP 500 é tratado explicitamente.
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    allowed_methods=["GET"],
+    raise_on_status=False,
+)
+_http_adapter = HTTPAdapter(max_retries=_retry_strategy)
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.mount("https://", _http_adapter)
+    s.mount("http://",  _http_adapter)
+    s.headers.update(API_HEADERS)
+    return s
+
+_session = _make_session()
 
 
 def get_api_date_range(reference_date: Optional[date] = None) -> tuple[date, date]:
@@ -133,7 +157,6 @@ def infer_period_from_api_url(api_url: str) -> Optional[tuple[int, int]]:
 
     return start_date.year, start_date.month
 
-
 def resolve_report_period(cli_year: Optional[int], cli_month: Optional[int]) -> tuple[int, int]:
     """Define o período do relatório priorizando CLI e depois a API_BASE_URL."""
     if cli_year is not None and cli_month is not None:
@@ -148,20 +171,11 @@ def resolve_report_period(cli_year: Optional[int], cli_month: Optional[int]) -> 
     return cli_year or today.year, cli_month or today.month
 
 # --- E-MAIL --------------------------------------------------------
-EMAIL_CONFIG = {
-    "smtp_server": "smtp.gmail.com",
-    "smtp_port":   587,
-    "username":    "matheus.arruda@tempoenergia.com.br",    # TODO
-    "password":    "Ma!%(#%&)",         # TODO  (use App Password no Gmail)
-    "from":        "matheus.arruda@tempoenergia.com.br",    # TODO
-    "to":          ["matheusarrudaxd@gmail.com"],  # TODO
-    "subject":     "Relatório Diário de Geração — {month_name}/{year}",
-    "body":        (
-        "Prezado(a),\n\n"
-        "Segue em anexo o relatório diário de geração referente a {month_name}/{year}.\n\n"
-        "Atenciosamente,\nSistema EnergoPro"
-    ),
-}
+EMAIL_SENDER    = "matheus.arruda@tempoenergia.com.br"
+EMAIL_PASSWORD  = "Ma!%(#%&"
+EMAIL_TO        = ["matheus.arruda@tempoenergia.com.br"]   # lista de destinatários
+EMAIL_SMTP_HOST = "smtp.office365.com"
+EMAIL_SMTP_PORT = 587
 
 # --- HORAS ESPERADAS POR DIA ---------------------------------------
 EXPECTED_HOURS_PER_DAY = 24   # ajuste se a API retornar 25 slots (0-24)
@@ -198,7 +212,7 @@ METER_TO_PLANT: dict[str, str] = {
     # "PEGCIPUS---01P": "USINA IPOJUCA",
     # "MSELDBTR1--01P": "ELDORADO BR",
     # "MSELDBTR2--02P": "ELDORADO BR",
-    # "TODIA-URDCO02P": "CRIO",
+    "TODIA-URDCO02P": "CRIO"
 }
 
 
@@ -240,8 +254,8 @@ CATEGORIES: dict[str, list[tuple[str, str]]] = {
         # ("PEGCIPUS---01P", "PEGCIPUS---01"),
         # ("MSELDBTR1--01P", "MSELDBTR1--01"),
         # ("MSELDBTR2--02P", "MSELDBTR2--02"),
-        # ("TODIA-URDCO02P", "TODIA-URDCO02"),
-    ],
+        ("TODIA-URDCO02P", "TODIA-URDCO02")
+    ]
 }
 
 # Gráficos: quais categorias agrupar em cada chart
@@ -283,20 +297,41 @@ def fetch_meter_data(meter_id: str, year: int, month: int) -> Optional[pd.DataFr
     ea_geracao_kwh, ea_consumo_kwh, er_geracao_kvarh, er_consumo_kvarh
     Retorna None se a API não responder ou não tiver dados.
     """
-    try:
-        params = build_api_params(meter_id, year, month)
-        resp = requests.get(
-            API_BASE_URL,
-            params=params,
-            headers=API_HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        json_data = resp.json()
+    params = build_api_params(meter_id, year, month)
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > API_MAX_ATTEMPTS:
+            log.warning("  [%s] %d tentativas esgotadas — sem dados.", meter_id, API_MAX_ATTEMPTS)
+            return None
 
-        # A API pode retornar {"dados": [...]} ou diretamente [...]
+        wait = 2 ** attempt if attempt <= 3 else random.randint(10, 20)
+
+        try:
+            resp = _session.get(API_BASE_URL, params=params, timeout=500)
+        except requests.exceptions.RequestException as exc:
+            log.warning("  [%s] Erro de conexão (tentativa %d/%d, próxima em %ds): %s", meter_id, attempt, API_MAX_ATTEMPTS, wait, exc)
+            time.sleep(wait)
+            continue
+        except Exception as exc:
+            log.error("  [%s] Erro inesperado: %s", meter_id, exc)
+            return None
+
+        if not resp.ok:
+            log.warning(
+                "  [%s] HTTP %s — tentativa %d/%d, próxima em %ds...",
+                meter_id, resp.status_code, attempt, API_MAX_ATTEMPTS, wait,
+            )
+            time.sleep(wait)
+            continue
+
+        try:
+            json_data = resp.json()
+        except Exception as exc:
+            log.error("  [%s] Resposta inválida (JSON): %s", meter_id, exc)
+            return None
+
         records = json_data.get("dados", json_data) if isinstance(json_data, dict) else json_data
-
         if not records:
             log.warning("  [%s] API retornou lista vazia.", meter_id)
             return None
@@ -307,24 +342,17 @@ def fetch_meter_data(meter_id: str, year: int, month: int) -> Optional[pd.DataFr
         df["ea_geracao_kwh"] = pd.to_numeric(df.get("ea_geracao_kwh", 0), errors="coerce").fillna(0)
         return df
 
-    except requests.exceptions.RequestException as exc:
-        log.warning("  [%s] Erro ao buscar dados: %s", meter_id, exc)
-        return None
-    except Exception as exc:
-        log.error("  [%s] Erro inesperado: %s", meter_id, exc)
-        return None
-
 
 def fetch_all_data(year: int, month: int) -> dict[str, Optional[pd.DataFrame]]:
-    """Busca dados de todos os medidores configurados."""
-    all_meters = {
+    """Busca dados de todos os medidores, um por vez."""
+    all_meters = sorted({
         meter_id
         for meters in CATEGORIES.values()
         for meter_id, _ in meters
-    }
+    })
     results: dict[str, Optional[pd.DataFrame]] = {}
-    for meter_id in sorted(all_meters):
-        log.info("Buscando medidor: %s", meter_id)
+    for idx, meter_id in enumerate(all_meters):
+        log.info("Buscando medidor: %s (%d/%d)", meter_id, idx + 1, len(all_meters))
         results[meter_id] = fetch_meter_data(meter_id, year, month)
     return results
 
@@ -809,15 +837,15 @@ def generate_pdf(
     year: int,
     month: int,
     meter_data: dict[str, Optional[pd.DataFrame]],
-    output_path: str,
-) -> str:
-    """Gera o PDF completo e salva em output_path."""
-    log.info("Gerando PDF: %s", output_path)
+) -> bytes:
+    """Gera o PDF completo em memória e retorna os bytes."""
+    log.info("Gerando PDF em memória")
 
     days_in_month = calendar.monthrange(year, month)[1]
 
+    pdf_buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        output_path,
+        pdf_buf,
         pagesize=landscape(A4),
         leftMargin=10 * mm,
         rightMargin=10 * mm,
@@ -881,8 +909,8 @@ def generate_pdf(
         story.append(row_tbl)
 
     doc.build(story)
-    log.info("PDF salvo: %s", output_path)
-    return output_path
+    log.info("PDF gerado: %d bytes", pdf_buf.tell())
+    return pdf_buf.getvalue()
 
 
 def build_section_table_html(
@@ -994,10 +1022,9 @@ def generate_html(
     year: int,
     month: int,
     meter_data: dict[str, Optional[pd.DataFrame]],
-    output_path: str,
 ) -> str:
-    """Gera o HTML completo e salva em output_path."""
-    log.info("Gerando HTML: %s", output_path)
+    """Gera o HTML completo em memória e retorna a string."""
+    log.info("Gerando HTML em memória")
 
     days_in_month = calendar.monthrange(year, month)[1]
     month_name_pt = [
@@ -1174,54 +1201,144 @@ def generate_html(
 </html>
 """
 
-    with open(output_path, "w", encoding="utf-8") as html_file:
-        html_file.write(html_content)
-
-    log.info("HTML salvo: %s", output_path)
-    return output_path
+    log.info("HTML gerado: %d chars", len(html_content))
+    return html_content
 
 
 # ═════════════════════════════════════════════
-# 10.  ENVIO POR E-MAIL
+# 10.  ENVIO DE E-MAIL (SMTP / Office365)
 # ═════════════════════════════════════════════
 
-def send_email(report_path: str, year: int, month: int) -> bool:
-    """Envia o relatÃ³rio HTML por e-mail via SMTP."""
+_SIG_DIR = os.path.join(
+    os.environ.get("APPDATA", ""),
+    "Microsoft", "Signatures",
+    "MATHEUS (matheus.arruda@tempoenergia.com.br)_arquivos",
+)
+
+
+def _get_email_signature() -> str:
+    img_path = os.path.join(_SIG_DIR, "image002.png")
+    logo_tag = ""
+    if os.path.exists(img_path):
+        with open(img_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("ascii")
+        logo_tag = (
+            f'<img src="data:image/png;base64,{img_b64}" '
+            f'width="214" height="67" style="display:block;" />'
+        )
+    return (
+        '<table border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">'
+        "<tr>"
+        '<td style="border-right:1px solid #6688C0;padding:0 12px 0 0;vertical-align:top;">'
+        '<p style="margin:0;font-family:Aptos,Arial,sans-serif;font-size:12pt;color:#201F1E;">'
+        "Atenciosamente,<br><br>"
+        '<strong style="color:black;">Matheus Arruda</strong></p>'
+        '<p style="margin:4px 0 0;font-family:Aptos,Arial,sans-serif;font-size:12pt;color:#201F1E;">'
+        "Rua do Rocio, n&ordm; 84, 9&ordm; andar</p>"
+        '<p style="margin:2px 0 0;font-family:Aptos,Arial,sans-serif;font-size:12pt;color:#201F1E;">'
+        "Vila Ol&iacute;mpia, S&atilde;o Paulo - SP, 04.552-000</p>"
+        '<p style="margin:2px 0 0;font-family:Aptos,Arial,sans-serif;font-size:12pt;color:#201F1E;">'
+        "<strong>t.</strong>&nbsp;+55 11 4780-6788 | <strong>cel.</strong>&nbsp;+55 11&nbsp;97156-2284</p>"
+        '<p style="margin:2px 0 0;font-family:Aptos,Arial,sans-serif;font-size:12pt;">'
+        '<a href="mailto:matheus.arruda@tempoenergia.com.br" style="color:#0563C1;">matheus.arruda@tempoenergia.com.br</a></p>'
+        '<p style="margin:2px 0 0;font-family:Aptos,Arial,sans-serif;font-size:12pt;">'
+        '<a href="http://www.tempoenergia.com.br/" style="color:#0563C1;">www.tempoenergia.com.br</a></p>'
+        "</td>"
+        '<td style="padding:0 0 0 12px;vertical-align:top;">'
+        f"{logo_tag}"
+        "</td>"
+        "</tr>"
+        "</table>"
+    )
+
+
+def screenshot_html(html_content: str) -> Optional[bytes]:
+    """Captura screenshot full-page do HTML em memória via Playwright. Retorna PNG bytes."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1900, "height": 900})
+            page.set_content(html_content, wait_until="load")
+            png_bytes = page.screenshot(full_page=True)
+            browser.close()
+        log.info("Screenshot gerado: %d bytes", len(png_bytes))
+        return png_bytes
+    except Exception as exc:
+        log.warning("Não foi possível gerar screenshot do HTML: %s", exc)
+        return None
+
+
+def send_email(pdf_bytes: bytes, year: int, month: int, html_content: Optional[str] = None) -> bool:
+    """
+    Envia o relatório por e-mail via SMTP (Office365).
+    Corpo: screenshot do HTML (inline) + assinatura.
+    Anexo: PDF do relatório (em memória, sem salvar em disco).
+    """
     month_names = [
         "", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
         "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
     ]
     month_name = month_names[month]
+    subject = f"Análise dos Pontos de Medição — {month_name}/{year}"
 
-    subject = EMAIL_CONFIG["subject"].format(month_name=month_name, year=year)
-    body    = EMAIL_CONFIG["body"].format(month_name=month_name, year=year)
+    screenshot_bytes = screenshot_html(html_content) if html_content else None
 
-    msg = MIMEMultipart()
-    msg["From"]    = EMAIL_CONFIG["from"]
-    msg["To"]      = ", ".join(EMAIL_CONFIG["to"])
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    # Anexa o HTML
-    with open(report_path, "r", encoding="utf-8") as f:
-        part = MIMEText(f.read(), "html", "utf-8")
-    part.add_header(
-        "Content-Disposition",
-        f'attachment; filename="{os.path.basename(report_path)}"',
+    screenshot_tag = (
+        '<p><img src="cid:relatorio_preview" style="max-width:100%;border:1px solid #ddd;'
+        'border-radius:8px;" alt="Prévia do Relatório" /></p>'
+        if screenshot_bytes else ""
     )
-    msg.attach(part)
+
+    body = (
+        "<html><body style='font-family:Segoe UI,Arial,sans-serif;'>"
+        "<p>Prezados,</p>"
+        "<p>Segue a análise hora a hora dos pontos de medição da geração das usinas da "
+        "Energo Pro e Gestão da Tempo Energia, considerando as informações do mês de "
+        f"<strong>{month_name}</strong>.</p>"
+        f"{screenshot_tag}"
+        "<br>"
+        + _get_email_signature()
+        + "</body></html>"
+    )
 
     try:
-        with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(EMAIL_CONFIG["username"], EMAIL_CONFIG["password"])
-            server.sendmail(
-                EMAIL_CONFIG["from"],
-                EMAIL_CONFIG["to"],
-                msg.as_string(),
+        for destinatario in EMAIL_TO:
+            # Estrutura: mixed → related (html + imagem inline) + pdf anexo
+            outer = MIMEMultipart("mixed")
+            outer["From"]    = EMAIL_SENDER
+            outer["To"]      = destinatario
+            outer["Subject"] = subject
+
+            related = MIMEMultipart("related")
+            related.attach(MIMEText(body, "html"))
+
+            if screenshot_bytes:
+                img_part = MIMEImage(screenshot_bytes, "png")
+                img_part.add_header("Content-ID", "<relatorio_preview>")
+                img_part.add_header("Content-Disposition", "inline", filename="relatorio_preview.png")
+                related.attach(img_part)
+
+            outer.attach(related)
+
+            ts = datetime.now().strftime("%Y%m%d")
+            pdf_filename = f"Relatorio_Geracao_{year}{month:02d}_{ts}.pdf"
+            attachment = MIMEBase("application", "octet-stream")
+            attachment.set_payload(pdf_bytes)
+            encoders.encode_base64(attachment)
+            attachment.add_header(
+                "Content-Disposition",
+                f"attachment; filename={pdf_filename}",
             )
-        log.info("E-mail enviado para: %s", ", ".join(EMAIL_CONFIG["to"]))
+            outer.attach(attachment)
+
+            with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT) as server:
+                server.starttls()
+                server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_SENDER, destinatario, outer.as_bytes())
+
+            log.info("E-mail enviado para: %s", destinatario)
+
         return True
     except Exception as exc:
         log.error("Falha ao enviar e-mail: %s", exc)
@@ -1238,7 +1355,6 @@ def generate_demo_data(year: int, month: int) -> dict[str, Optional[pd.DataFrame
     Remove esta função quando a API estiver disponível.
     """
     import numpy as np
-    import random
 
     days_in_month = calendar.monthrange(year, month)[1]
     all_meters = {
@@ -1312,7 +1428,7 @@ def main():
     parser.add_argument("--demo",     action="store_true",
                         help="Usa dados simulados (sem conexão com a API)")
     parser.add_argument("--output",   type=str, default=None,
-                        help="Caminho de saída do HTML")
+                        help="Se informado, salva HTML e PDF no caminho base indicado")
     args = parser.parse_args()
 
     year, month = resolve_report_period(args.year, args.month)
@@ -1330,24 +1446,28 @@ def main():
     else:
         meter_data = fetch_all_data(year, month)
 
-    # Nome do arquivo de saída
+    # Geração em memória (sem salvar em disco por padrão)
+    html_content = generate_html(year, month, meter_data)
+    pdf_bytes    = generate_pdf(year, month, meter_data)
+
+    # Salva em disco somente se --output for fornecido
     if args.output:
-        output_path = args.output
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"Relatorio_Geracao_{year}{month:02d}_{ts}.html"
+        base_path = args.output.removesuffix(".html").removesuffix(".pdf")
+        html_path = f"{base_path}.html"
+        pdf_path  = f"{base_path}.pdf"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+        log.info("Arquivos salvos: %s | %s", html_path, pdf_path)
 
-    # Geração do HTML
-    generate_html(year, month, meter_data, output_path)
-
-    # Envio por e-mail
+    # Envia e-mail com screenshot inline + PDF em anexo
     if not args.no_email:
-        send_email(output_path, year, month)
+        send_email(pdf_bytes, year, month, html_content=html_content)
     else:
         log.info("Envio de e-mail desabilitado (--no-email).")
 
-    log.info("Concluído! Arquivo: %s", output_path)
-    return output_path
+    log.info("Concluído.")
 
 
 if __name__ == "__main__":
